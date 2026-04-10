@@ -251,14 +251,18 @@ def nmse_db(prediction: np.ndarray, reference: np.ndarray) -> float:
 #
 # ---------------------------------------------------------------------------
 
-# PA coefficients c_{k,q} — random complex values (K=5, Q=2, odd k only)
-_rng_pa = np.random.RandomState(7)
-PA_COEFFS = {}
-for _k in (1, 3, 5):
-    for _q in range(3):
-        mag = {1: 1.0, 3: 0.3, 5: 0.8}[_k] * np.exp(-0.4 * _q)
-        PA_COEFFS[(_k, _q)] = mag * np.exp(1j * _rng_pa.uniform(-np.pi, np.pi))
-del _rng_pa, _k, _q, mag
+# PA coefficients c_{k,q} from Eq. 12  (K=5, Q=2, odd k only)
+PA_COEFFS = {
+    (1, 0):  1.0513 + 0.0904j,
+    (1, 1): -0.0680 - 0.0023j,
+    (1, 2):  0.0289 - 0.0054j,
+    (3, 0): -0.0542 - 0.2900j,
+    (3, 1):  0.2234 + 0.2317j,
+    (3, 2): -0.0621 - 0.0932j,
+    (5, 0): -0.9657 - 0.7028j,
+    (5, 1): -0.2451 - 0.3735j,
+    (5, 2):  0.1229 + 0.1508j,
+}
 
 
 def memory_polynomial_pa(
