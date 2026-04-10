@@ -244,6 +244,61 @@ def nmse_db(prediction: np.ndarray, reference: np.ndarray) -> float:
     return 10.0 * np.log10(mse / pwr)
 
 
+def aclr_db(
+    signal_iq: np.ndarray,
+    fs: float,
+    channel_bw: float,
+    adjacent_offset: Optional[float] = None,
+    nperseg: int = 4096,
+) -> Tuple[float, float]:
+    """
+    Compute Adjacent Channel Leakage Ratio (ACLR) per 3GPP TS 38.104.
+
+    ACLR = 10 log10( P_channel / P_adjacent )
+
+    Measured separately for the lower and upper adjacent channels.
+
+    Parameters
+    ----------
+    signal_iq      : (N, 2) I/Q signal to measure
+    fs             : sampling rate [Hz]
+    channel_bw     : channel bandwidth [Hz] (e.g. 20e6)
+    adjacent_offset: center-to-center spacing to adjacent channel [Hz].
+                     Defaults to channel_bw (the standard NR definition).
+    nperseg        : Welch segment length
+
+    Returns
+    -------
+    aclr_lower : ACLR for the lower adjacent channel [dB] (positive = good)
+    aclr_upper : ACLR for the upper adjacent channel [dB] (positive = good)
+    """
+    from scipy.signal import welch as _welch
+
+    if adjacent_offset is None:
+        adjacent_offset = channel_bw
+
+    c = iq_to_complex(signal_iq) if signal_iq.ndim == 2 else signal_iq
+    f, psd = _welch(c, fs=fs, nperseg=nperseg,
+                    noverlap=nperseg // 2,
+                    return_onesided=False, scaling='density')
+
+    df = f[1] - f[0]
+
+    def band_power(f_lo, f_hi):
+        mask = (f >= f_lo) & (f < f_hi)
+        return np.sum(psd[mask]) * df
+
+    p_main  = band_power(-channel_bw / 2, channel_bw / 2)
+    p_lower = band_power(-adjacent_offset - channel_bw / 2,
+                         -adjacent_offset + channel_bw / 2)
+    p_upper = band_power( adjacent_offset - channel_bw / 2,
+                          adjacent_offset + channel_bw / 2)
+
+    aclr_lower = 10.0 * np.log10(p_main / p_lower) if p_lower > 0 else np.inf
+    aclr_upper = 10.0 * np.log10(p_main / p_upper) if p_upper > 0 else np.inf
+    return aclr_lower, aclr_upper
+
+
 # ---------------------------------------------------------------------------
 # Odd-order Memory Polynomial PA Model  (Eq. 11)
 #
@@ -445,11 +500,20 @@ def main():
     nmse_before = nmse_db(y_test_no_dpd, ideal_output)
     nmse_after  = nmse_db(y_test_with_dpd, ideal_output)
 
-    print(f"\n{'='*50}")
-    print(f"  NMSE without DPD : {nmse_before:+.2f} dB")
-    print(f"  NMSE with GMP DPD: {nmse_after:+.2f} dB")
-    print(f"  Improvement      : {nmse_before - nmse_after:.2f} dB")
-    print(f"{'='*50}")
+    channel_bw_hz = bw_mhz * 1e6
+    aclr_lo_no,  aclr_hi_no  = aclr_db(y_test_no_dpd,  fs, channel_bw_hz, nperseg=n_fft)
+    aclr_lo_dpd, aclr_hi_dpd = aclr_db(y_test_with_dpd, fs, channel_bw_hz, nperseg=n_fft)
+    aclr_lo_ideal, aclr_hi_ideal = aclr_db(ideal_output, fs, channel_bw_hz, nperseg=n_fft)
+
+    print(f"\n{'='*60}")
+    print(f"  {'Metric':<28s} {'No DPD':>10s} {'GMP DPD':>10s} {'Ideal':>10s}")
+    print(f"  {'-'*56}")
+    print(f"  {'NMSE (dB)':<28s} {nmse_before:>+10.2f} {nmse_after:>+10.2f} {'—':>10s}")
+    print(f"  {'ACLR lower (dB)':<28s} {aclr_lo_no:>10.2f} {aclr_lo_dpd:>10.2f} {aclr_lo_ideal:>10.2f}")
+    print(f"  {'ACLR upper (dB)':<28s} {aclr_hi_no:>10.2f} {aclr_hi_dpd:>10.2f} {aclr_hi_ideal:>10.2f}")
+    print(f"  {'-'*56}")
+    print(f"  NMSE improvement: {nmse_before - nmse_after:.2f} dB")
+    print(f"{'='*60}")
 
     # ------------------------------------------------------------------
     # 6. PSD Plot  (frequency axis: −61.44 … +61.44 MHz)
