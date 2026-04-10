@@ -574,7 +574,7 @@ def main():
     nmse_after  = nmse_db(y_test_with_dpd, ideal_output)
 
     channel_bw_hz = bw_mhz * 1e6
-    nperseg_metric = 32768
+    nperseg_metric = 8192
     aclr_lo_no,  aclr_hi_no  = aclr_db(y_test_no_dpd,  fs, channel_bw_hz, nperseg=nperseg_metric)
     aclr_lo_dpd, aclr_hi_dpd = aclr_db(y_test_with_dpd, fs, channel_bw_hz, nperseg=nperseg_metric)
     aclr_lo_ideal, aclr_hi_ideal = aclr_db(ideal_output, fs, channel_bw_hz, nperseg=nperseg_metric)
@@ -599,13 +599,14 @@ def main():
         from scipy.signal import welch
 
         from scipy.signal.windows import blackmanharris
-        nperseg_psd = 32768
+        nperseg_psd = 8192
+        noverlap_psd = nperseg_psd * 3 // 4   # 75% overlap
         psd_window = blackmanharris(nperseg_psd)
 
         def compute_psd(iq):
             c = iq_to_complex(iq) if iq.ndim == 2 else iq
             f, p = welch(c, fs=fs, nperseg=nperseg_psd, window=psd_window,
-                         noverlap=nperseg_psd // 2,
+                         noverlap=noverlap_psd,
                          return_onesided=False, scaling='density')
             idx = np.argsort(f)
             return f[idx], p[idx]
