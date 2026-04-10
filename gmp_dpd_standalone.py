@@ -500,8 +500,8 @@ def main():
     fs              = 61.44e6   # sampling rate → ±30.72 MHz Nyquist
     n_codes         = 8         # active codes per carrier
 
-    N_train = 200_000
-    N_test  = 50_000
+    N_train = 1_000_000
+    N_test  = 1_000_000
 
     print(f"WCDMA signal: {n_carriers}× carriers, {carrier_bw_mhz} MHz each, "
           f"aggregate BW={bw_mhz} MHz, chip rate={chip_rate/1e6:.2f} Mcps, "
@@ -517,8 +517,8 @@ def main():
         N_test, n_carriers=n_carriers, carrier_spacing=carrier_spacing,
         n_codes=n_codes, chip_rate=chip_rate, fs=fs)
 
-    # Scale signal to drive the PA into significant compression.
-    target_rms = 0.28
+    # Scale signal to drive the PA into moderate compression.
+    target_rms = 0.22
     x_train_c *= target_rms / np.sqrt(np.mean(np.abs(x_train_c)**2))
     x_test_c  *= target_rms / np.sqrt(np.mean(np.abs(x_test_c)**2))
 
@@ -574,7 +574,7 @@ def main():
     nmse_after  = nmse_db(y_test_with_dpd, ideal_output)
 
     channel_bw_hz = bw_mhz * 1e6
-    nperseg_metric = 4096
+    nperseg_metric = 32768
     aclr_lo_no,  aclr_hi_no  = aclr_db(y_test_no_dpd,  fs, channel_bw_hz, nperseg=nperseg_metric)
     aclr_lo_dpd, aclr_hi_dpd = aclr_db(y_test_with_dpd, fs, channel_bw_hz, nperseg=nperseg_metric)
     aclr_lo_ideal, aclr_hi_ideal = aclr_db(ideal_output, fs, channel_bw_hz, nperseg=nperseg_metric)
@@ -598,11 +598,13 @@ def main():
         import matplotlib.pyplot as plt
         from scipy.signal import welch
 
-        nperseg_psd = 4096
+        from scipy.signal.windows import blackmanharris
+        nperseg_psd = 32768
+        psd_window = blackmanharris(nperseg_psd)
 
         def compute_psd(iq):
             c = iq_to_complex(iq) if iq.ndim == 2 else iq
-            f, p = welch(c, fs=fs, nperseg=nperseg_psd,
+            f, p = welch(c, fs=fs, nperseg=nperseg_psd, window=psd_window,
                          noverlap=nperseg_psd // 2,
                          return_onesided=False, scaling='density')
             idx = np.argsort(f)
