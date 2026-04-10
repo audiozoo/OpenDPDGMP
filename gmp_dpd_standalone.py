@@ -438,35 +438,86 @@ def generate_wcdma(
     return filtered[start : start + n_samples]
 
 
+def generate_multicarrier_wcdma(
+    n_samples: int,
+    n_carriers: int = 3,
+    carrier_spacing: float = 5e6,
+    n_codes: int = 8,
+    chip_rate: float = 3.84e6,
+    fs: float = 61.44e6,
+    sf: int = 16,
+) -> np.ndarray:
+    """
+    Generate a multi-carrier WCDMA baseband signal.
+
+    Each carrier is an independent WCDMA signal frequency-shifted to its
+    centre frequency.  Carriers are placed symmetrically around DC with
+    *carrier_spacing* between adjacent centres.
+
+    Parameters
+    ----------
+    n_samples       : desired output length at rate *fs*
+    n_carriers      : number of WCDMA carriers
+    carrier_spacing : centre-to-centre spacing [Hz] (typically 5 MHz)
+    n_codes         : active codes per carrier
+    chip_rate       : WCDMA chip rate [Hz]
+    fs              : output sampling rate [Hz]
+    sf              : spreading factor per code
+
+    Returns
+    -------
+    signal : complex ndarray, shape (n_samples,)
+    """
+    composite = np.zeros(n_samples, dtype=np.complex128)
+    t = np.arange(n_samples) / fs
+
+    f_centres = (np.arange(n_carriers) - (n_carriers - 1) / 2.0) * carrier_spacing
+
+    for i, fc in enumerate(f_centres):
+        carrier = generate_wcdma(n_samples, n_codes=n_codes,
+                                 chip_rate=chip_rate, fs=fs, sf=sf)
+        composite += carrier * np.exp(1j * 2 * np.pi * fc * t)
+
+    composite /= np.sqrt(n_carriers)
+    return composite
+
+
 # ===================================================================
-# Example / Demo  —  WCDMA 5 MHz carrier
+# Example / Demo  —  3× WCDMA carriers (15 MHz aggregate)
 # ===================================================================
 
 def main():
     np.random.seed(42)
 
     # ==================================================================
-    # WCDMA signal parameters
+    # Multi-carrier WCDMA signal parameters
     # ==================================================================
-    chip_rate = 3.84e6      # 3.84 Mcps
-    bw_mhz   = 5            # 5 MHz channel bandwidth
-    fs        = 30.72e6     # 8× oversampled → ±15.36 MHz Nyquist
-    n_codes   = 8           # active channelisation codes
+    chip_rate       = 3.84e6    # 3.84 Mcps
+    carrier_bw_mhz  = 5         # per-carrier BW
+    n_carriers      = 3
+    carrier_spacing = 5e6       # 5 MHz centre-to-centre
+    bw_mhz          = n_carriers * carrier_bw_mhz   # 15 MHz aggregate
+    fs              = 61.44e6   # sampling rate → ±30.72 MHz Nyquist
+    n_codes         = 8         # active codes per carrier
 
-    N_train = 200_000       # training samples at fs
-    N_test  = 50_000        # test samples at fs
+    N_train = 200_000
+    N_test  = 50_000
 
-    print(f"WCDMA signal: BW={bw_mhz} MHz, chip rate={chip_rate/1e6:.2f} Mcps, "
-          f"{n_codes} codes, fs={fs/1e6:.2f} MHz")
+    print(f"WCDMA signal: {n_carriers}× carriers, {carrier_bw_mhz} MHz each, "
+          f"aggregate BW={bw_mhz} MHz, chip rate={chip_rate/1e6:.2f} Mcps, "
+          f"{n_codes} codes/carrier, fs={fs/1e6:.2f} MHz")
 
     # ------------------------------------------------------------------
-    # 1. Generate WCDMA signals
+    # 1. Generate multi-carrier WCDMA signals
     # ------------------------------------------------------------------
-    x_train_c = generate_wcdma(N_train, n_codes=n_codes, chip_rate=chip_rate, fs=fs)
-    x_test_c  = generate_wcdma(N_test,  n_codes=n_codes, chip_rate=chip_rate, fs=fs)
+    x_train_c = generate_multicarrier_wcdma(
+        N_train, n_carriers=n_carriers, carrier_spacing=carrier_spacing,
+        n_codes=n_codes, chip_rate=chip_rate, fs=fs)
+    x_test_c = generate_multicarrier_wcdma(
+        N_test, n_carriers=n_carriers, carrier_spacing=carrier_spacing,
+        n_codes=n_codes, chip_rate=chip_rate, fs=fs)
 
     # Scale signal to drive the PA into significant compression.
-    # WCDMA PAPR ~8.6 dB → peaks reach ~0.76 where k=5 terms are strong.
     target_rms = 0.28
     x_train_c *= target_rms / np.sqrt(np.mean(np.abs(x_train_c)**2))
     x_test_c  *= target_rms / np.sqrt(np.mean(np.abs(x_test_c)**2))
@@ -577,15 +628,19 @@ def main():
         ax.plot(f_mhz, psd_with_dpd_db, color='#d62728',  linewidth=1.0,
                 label='PA output — with GMP DPD')
 
-        ax.axvspan(-bw_mhz / 2, bw_mhz / 2, color='green', alpha=0.06,
-                   label=f'{bw_mhz} MHz channel')
+        for ci in range(n_carriers):
+            fc = (ci - (n_carriers - 1) / 2.0) * carrier_spacing / 1e6
+            lo, hi = fc - carrier_bw_mhz / 2, fc + carrier_bw_mhz / 2
+            lbl = f'{carrier_bw_mhz} MHz carrier' if ci == 0 else None
+            ax.axvspan(lo, hi, color='green', alpha=0.06, label=lbl)
 
         ax.set_xlim(-20, 20)
         ax.set_ylim(-80, 5)
         ax.set_xlabel('Frequency (MHz)', fontsize=12)
         ax.set_ylabel('PSD (dB, normalized)', fontsize=12)
-        ax.set_title(f'WCDMA {bw_mhz} MHz · {chip_rate/1e6:.2f} Mcps · '
-                     f'{n_codes} codes · '
+        ax.set_title(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz · '
+                     f'{chip_rate/1e6:.2f} Mcps · '
+                     f'{n_codes} codes/carrier · '
                      f'MP PA (K={pa_K} odd, Q={pa_Q}) · '
                      f'GMP DPD (Ka={cfg.Ka} La={cfg.La} Kb={cfg.Kb} '
                      f'Lb={cfg.Lb} Mb={cfg.Mb} Kc={cfg.Kc} Lc={cfg.Lc} '
