@@ -358,94 +358,116 @@ def memory_polynomial_pa(
 
 
 # ---------------------------------------------------------------------------
-# 5G NR OFDM Signal Generator
+# WCDMA Signal Generator
 # ---------------------------------------------------------------------------
 
-def generate_64qam(n: int) -> np.ndarray:
-    """Generate *n* random 64-QAM symbols (unit average power)."""
-    levels = np.array([-7, -5, -3, -1, 1, 3, 5, 7])
-    i = np.random.choice(levels, n)
-    q = np.random.choice(levels, n)
-    return (i + 1j * q) / np.sqrt(42.0)
-
-
-def generate_5g_nr_ofdm(
-    n_symbols: int,
-    n_rb: int = 51,
-    scs: float = 30e3,
-    fs: float = 122.88e6,
+def generate_wcdma(
+    n_samples: int,
+    n_codes: int = 8,
+    chip_rate: float = 3.84e6,
+    fs: float = 30.72e6,
+    sf: int = 16,
 ) -> np.ndarray:
     """
-    Generate a 5G NR-like OFDM time-domain signal (complex baseband).
+    Generate a WCDMA-like downlink baseband signal.
+
+    Sums multiple OVSF-spread QPSK channels, each at a given spreading
+    factor, then upsamples to the target sampling rate using an RRC filter.
 
     Parameters
     ----------
-    n_symbols : number of OFDM symbols to generate
-    n_rb      : resource blocks (51 for 20 MHz BW with 30 kHz SCS, TS 38.104)
-    scs       : subcarrier spacing [Hz]
-    fs        : sampling rate [Hz]
+    n_samples : desired number of output samples at rate *fs*
+    n_codes   : number of simultaneously active channelisation codes
+    chip_rate : WCDMA chip rate [Hz] (3.84 Mcps)
+    fs        : output sampling rate [Hz]
+    sf        : spreading factor per code channel
 
     Returns
     -------
-    signal : complex ndarray — time-domain baseband samples
+    signal : complex ndarray, shape (n_samples,) — baseband at rate fs
     """
-    n_fft = int(fs / scs)                       # 4096
-    n_sc = n_rb * 12                             # 612 active subcarriers
-    n_sc_half = n_sc // 2                        # 306 per side
+    oversample = int(round(fs / chip_rate))  # 8 for 30.72 MHz
+    n_chips = n_samples // oversample + sf
 
-    # Normal CP lengths per slot (14 symbols) at 122.88 MHz, μ=1
-    # Symbols 0 and 7 carry extended CP; total CP per slot = 4096 samples
-    cp_per_slot = [320, 288, 288, 288, 288, 288, 288,
-                   320, 288, 288, 288, 288, 288, 288]
+    # OVSF codes (Walsh-Hadamard rows)
+    def _ovsf(sf_val, code_idx):
+        h = np.array([[1]])
+        while h.shape[0] < sf_val:
+            h = np.block([[h, h], [h, -h]])
+        return h[code_idx % sf_val]
 
-    parts = []
-    for s in range(n_symbols):
-        data = generate_64qam(n_sc)
+    composite = np.zeros(n_chips, dtype=np.complex128)
+    n_symbols_per_code = n_chips // sf
 
-        freq = np.zeros(n_fft, dtype=np.complex128)
-        freq[1 : n_sc_half + 1]      = data[n_sc_half:]    # positive freqs
-        freq[n_fft - n_sc_half :]     = data[:n_sc_half]    # negative freqs
+    for c in range(n_codes):
+        qpsk = (np.sign(np.random.randn(n_symbols_per_code))
+                + 1j * np.sign(np.random.randn(n_symbols_per_code))) / np.sqrt(2)
+        spread = np.repeat(qpsk, sf) * np.tile(_ovsf(sf, c + 1), n_symbols_per_code)
+        composite[:len(spread)] += spread
 
-        td = np.fft.ifft(freq) * np.sqrt(n_fft)
+    composite /= np.sqrt(n_codes)
 
-        cp_len = cp_per_slot[s % 14]
-        parts.append(np.concatenate([td[-cp_len:], td]))
+    # Upsample by inserting zeros then apply RRC pulse-shaping filter
+    upsampled = np.zeros(n_chips * oversample, dtype=np.complex128)
+    upsampled[::oversample] = composite
 
-    return np.concatenate(parts)
+    # RRC filter (roll-off 0.22 per 3GPP, 12-symbol span)
+    alpha = 0.22
+    span_syms = 12
+    t_rrc = np.arange(-span_syms * oversample, span_syms * oversample + 1) / oversample
+    eps = 1e-12
+    h_rrc = np.where(
+        np.abs(t_rrc) < eps,
+        1.0 - alpha + 4.0 * alpha / np.pi,
+        np.where(
+            np.abs(np.abs(t_rrc) - 1.0 / (4.0 * alpha)) < eps,
+            alpha / np.sqrt(2) * (
+                (1 + 2 / np.pi) * np.sin(np.pi / (4 * alpha))
+                + (1 - 2 / np.pi) * np.cos(np.pi / (4 * alpha))
+            ),
+            (np.sin(np.pi * t_rrc * (1 - alpha))
+             + 4 * alpha * t_rrc * np.cos(np.pi * t_rrc * (1 + alpha))
+            ) / (np.pi * t_rrc * (1 - (4 * alpha * t_rrc) ** 2 + eps))
+        )
+    )
+    h_rrc /= np.sqrt(np.sum(h_rrc ** 2))
+    h_rrc *= oversample
+
+    filtered = np.convolve(upsampled, h_rrc, mode='full')
+    start = len(h_rrc) // 2
+    return filtered[start : start + n_samples]
 
 
 # ===================================================================
-# Example / Demo  —  5G NR 20 MHz, SCS = 30 kHz
+# Example / Demo  —  WCDMA 5 MHz carrier
 # ===================================================================
 
 def main():
     np.random.seed(42)
 
     # ==================================================================
-    # 5G NR signal parameters
+    # WCDMA signal parameters
     # ==================================================================
-    scs       = 30e3        # subcarrier spacing
-    bw_mhz    = 20          # channel bandwidth
-    n_rb      = 51          # RBs for 20 MHz @ 30 kHz SCS  (TS 38.104)
-    fs        = 122.88e6    # sampling rate  → ±61.44 MHz PSD span
-    n_fft     = int(fs / scs)   # 4096
+    chip_rate = 3.84e6      # 3.84 Mcps
+    bw_mhz   = 5            # 5 MHz channel bandwidth
+    fs        = 30.72e6     # 8× oversampled → ±15.36 MHz Nyquist
+    n_codes   = 8           # active channelisation codes
 
-    n_train_symbols = 200   # ~870 k samples
-    n_test_symbols  = 50    # ~218 k samples
+    N_train = 200_000       # training samples at fs
+    N_test  = 50_000        # test samples at fs
 
-    print(f"5G NR signal: BW={bw_mhz} MHz, SCS={scs/1e3:.0f} kHz, "
-          f"N_RB={n_rb}, N_sc={n_rb*12}, N_FFT={n_fft}, fs={fs/1e6:.2f} MHz")
+    print(f"WCDMA signal: BW={bw_mhz} MHz, chip rate={chip_rate/1e6:.2f} Mcps, "
+          f"{n_codes} codes, fs={fs/1e6:.2f} MHz")
 
     # ------------------------------------------------------------------
-    # 1. Generate OFDM signals
+    # 1. Generate WCDMA signals
     # ------------------------------------------------------------------
-    x_train_c = generate_5g_nr_ofdm(n_train_symbols, n_rb=n_rb, scs=scs, fs=fs)
-    x_test_c  = generate_5g_nr_ofdm(n_test_symbols,  n_rb=n_rb, scs=scs, fs=fs)
+    x_train_c = generate_wcdma(N_train, n_codes=n_codes, chip_rate=chip_rate, fs=fs)
+    x_test_c  = generate_wcdma(N_test,  n_codes=n_codes, chip_rate=chip_rate, fs=fs)
 
-    # Scale signal so the PA operates in mild compression.
-    # The PA coefficients (Eq. 12) are designed for signals with peak
-    # amplitude near 0.5, where the k=3 and k=5 terms contribute visibly.
-    target_rms = 0.15
+    # Scale signal to drive the PA into significant compression.
+    # WCDMA PAPR ~8.6 dB → peaks reach ~0.76 where k=5 terms are strong.
+    target_rms = 0.28
     x_train_c *= target_rms / np.sqrt(np.mean(np.abs(x_train_c)**2))
     x_test_c  *= target_rms / np.sqrt(np.mean(np.abs(x_test_c)**2))
 
@@ -501,9 +523,10 @@ def main():
     nmse_after  = nmse_db(y_test_with_dpd, ideal_output)
 
     channel_bw_hz = bw_mhz * 1e6
-    aclr_lo_no,  aclr_hi_no  = aclr_db(y_test_no_dpd,  fs, channel_bw_hz, nperseg=n_fft)
-    aclr_lo_dpd, aclr_hi_dpd = aclr_db(y_test_with_dpd, fs, channel_bw_hz, nperseg=n_fft)
-    aclr_lo_ideal, aclr_hi_ideal = aclr_db(ideal_output, fs, channel_bw_hz, nperseg=n_fft)
+    nperseg_metric = 4096
+    aclr_lo_no,  aclr_hi_no  = aclr_db(y_test_no_dpd,  fs, channel_bw_hz, nperseg=nperseg_metric)
+    aclr_lo_dpd, aclr_hi_dpd = aclr_db(y_test_with_dpd, fs, channel_bw_hz, nperseg=nperseg_metric)
+    aclr_lo_ideal, aclr_hi_ideal = aclr_db(ideal_output, fs, channel_bw_hz, nperseg=nperseg_metric)
 
     print(f"\n{'='*60}")
     print(f"  {'Metric':<28s} {'No DPD':>10s} {'GMP DPD':>10s} {'Ideal':>10s}")
@@ -516,7 +539,7 @@ def main():
     print(f"{'='*60}")
 
     # ------------------------------------------------------------------
-    # 6. PSD Plot  (frequency axis: −61.44 … +61.44 MHz)
+    # 6. PSD Plot  (frequency axis: −20 … +20 MHz)
     # ------------------------------------------------------------------
     try:
         import matplotlib
@@ -524,7 +547,7 @@ def main():
         import matplotlib.pyplot as plt
         from scipy.signal import welch
 
-        nperseg_psd = n_fft  # one full OFDM symbol → Δf = SCS = 30 kHz
+        nperseg_psd = 4096
 
         def compute_psd(iq):
             c = iq_to_complex(iq) if iq.ndim == 2 else iq
@@ -554,15 +577,15 @@ def main():
         ax.plot(f_mhz, psd_with_dpd_db, color='#d62728',  linewidth=1.0,
                 label='PA output — with GMP DPD')
 
-        # Channel bandwidth shading
         ax.axvspan(-bw_mhz / 2, bw_mhz / 2, color='green', alpha=0.06,
                    label=f'{bw_mhz} MHz channel')
 
-        ax.set_xlim(-61.44, 61.44)
+        ax.set_xlim(-20, 20)
         ax.set_ylim(-80, 5)
         ax.set_xlabel('Frequency (MHz)', fontsize=12)
         ax.set_ylabel('PSD (dB, normalized)', fontsize=12)
-        ax.set_title(f'5G NR {bw_mhz} MHz · SCS {scs/1e3:.0f} kHz · '
+        ax.set_title(f'WCDMA {bw_mhz} MHz · {chip_rate/1e6:.2f} Mcps · '
+                     f'{n_codes} codes · '
                      f'MP PA (K={pa_K} odd, Q={pa_Q}) · '
                      f'GMP DPD (Ka={cfg.Ka} La={cfg.La} Kb={cfg.Kb} '
                      f'Lb={cfg.Lb} Mb={cfg.Mb} Kc={cfg.Kc} Lc={cfg.Lc} '
@@ -572,8 +595,8 @@ def main():
         ax.grid(True, alpha=0.3)
 
         fig.tight_layout()
-        fig.savefig('gmp_dpd_5gnr_psd.png', dpi=150)
-        print(f"\nPSD plot saved to gmp_dpd_5gnr_psd.png")
+        fig.savefig('gmp_dpd_wcdma_psd.png', dpi=150)
+        print(f"\nPSD plot saved to gmp_dpd_wcdma_psd.png")
         plt.show()
 
     except ImportError:
