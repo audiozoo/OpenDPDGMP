@@ -435,7 +435,21 @@ def generate_wcdma(
 
     filtered = np.convolve(upsampled, h_rrc, mode='full')
     start = len(h_rrc) // 2
-    return filtered[start : start + n_samples]
+    rrc_out = filtered[start : start + n_samples]
+
+    # Channel FIR filter: -80 dB sidelobes, passband = occupied BW
+    from scipy.signal import firwin, kaiserord
+    passband_edge = chip_rate * (1 + alpha) / 2
+    stopband_edge = passband_edge + 0.5e6
+    transition_width = stopband_edge - passband_edge
+    numtaps, beta = kaiserord(80, transition_width / (fs / 2))
+    if numtaps % 2 == 0:
+        numtaps += 1
+    cutoff = (passband_edge + stopband_edge) / 2
+    h_chan = firwin(numtaps, cutoff, window=('kaiser', beta), fs=fs)
+    chan_filtered = np.convolve(rrc_out, h_chan, mode='full')
+    start2 = len(h_chan) // 2
+    return chan_filtered[start2 : start2 + n_samples]
 
 
 def generate_multicarrier_wcdma(
