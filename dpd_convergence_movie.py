@@ -100,6 +100,25 @@ def nmse_db(pred, ref):
     return 10 * np.log10(np.mean(err[:, 0]**2 + err[:, 1]**2) /
                          np.mean(ref[:, 0]**2 + ref[:, 1]**2))
 
+def aclr_db(signal_iq, fs, channel_bw, adjacent_offset=None, nperseg=8192):
+    """ACLR (lower, upper) in dB. Higher is better."""
+    if adjacent_offset is None:
+        adjacent_offset = channel_bw
+    c = iq_to_complex(signal_iq) if signal_iq.ndim == 2 else signal_iq
+    f, psd = welch(c, fs=fs, nperseg=nperseg, noverlap=nperseg // 2,
+                   return_onesided=False, scaling='density')
+    df = f[1] - f[0]
+    def band_power(f_lo, f_hi):
+        return np.sum(psd[(f >= f_lo) & (f < f_hi)]) * df
+    p_main  = band_power(-channel_bw / 2, channel_bw / 2)
+    p_lower = band_power(-adjacent_offset - channel_bw / 2,
+                         -adjacent_offset + channel_bw / 2)
+    p_upper = band_power( adjacent_offset - channel_bw / 2,
+                          adjacent_offset + channel_bw / 2)
+    lo = 10 * np.log10(p_main / p_lower) if p_lower > 0 else np.inf
+    hi = 10 * np.log10(p_main / p_upper) if p_upper > 0 else np.inf
+    return lo, hi
+
 
 # ===================================================================
 # PA model
@@ -250,10 +269,14 @@ def main():
     f_mhz, psd_ideal = compute_psd_db(ideal_output)
     _, psd_no_dpd = compute_psd_db(y_no_dpd)
 
-    frames = []  # (label, psd_db, nmse)
-    frames.append(("Iteration 0 — no DPD",
-                    psd_no_dpd,
-                    nmse_db(y_no_dpd, ideal_output)))
+    channel_bw_hz = n_carriers * carrier_bw_mhz * 1e6
+
+    # frames: (iteration, psd_db, nmse, aclr_lower, aclr_upper)
+    nmse_0 = nmse_db(y_no_dpd, ideal_output)
+    aclr_lo_0, aclr_hi_0 = aclr_db(y_no_dpd, fs, channel_bw_hz)
+    frames = [(0, psd_no_dpd, nmse_0, aclr_lo_0, aclr_hi_0)]
+    print(f"  Iteration 0 (no DPD): NMSE = {nmse_0:+.2f} dB, "
+          f"ACLR = {aclr_lo_0:.1f} / {aclr_hi_0:.1f} dB")
 
     # First identification from raw PA I/O
     w = identify_gmp(x_iq, y_no_dpd, cfg, target_gain)
@@ -262,84 +285,166 @@ def main():
         x_dpd = apply_dpd(x_iq, w, cfg)
         y_dpd = pa(x_dpd)
         nmse = nmse_db(y_dpd, ideal_output)
+        aclr_lo, aclr_hi = aclr_db(y_dpd, fs, channel_bw_hz)
         _, psd = compute_psd_db(y_dpd)
-        frames.append((f"Iteration {it}", psd, nmse))
-        print(f"  Iteration {it}: NMSE = {nmse:+.2f} dB")
+        frames.append((it, psd, nmse, aclr_lo, aclr_hi))
+        print(f"  Iteration {it}: NMSE = {nmse:+.2f} dB, "
+              f"ACLR = {aclr_lo:.1f} / {aclr_hi:.1f} dB")
 
-        # Re-identify from the DPD'd input and its PA output
         w = identify_gmp(x_dpd, y_dpd, cfg, target_gain)
 
     # ---------------------------------------------------------------
-    # Build movie
+    # Build movie  (2 subplots: PSD + ACLR vs iteration)
     # ---------------------------------------------------------------
     print(f"\nRendering movie ({len(frames)} frames)...")
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    all_iters    = [f[0] for f in frames]
+    all_aclr_lo  = [f[3] for f in frames]
+    all_aclr_hi  = [f[4] for f in frames]
+    aclr_min = min(min(all_aclr_lo), min(all_aclr_hi))
+    aclr_max = max(max(all_aclr_lo), max(all_aclr_hi))
 
-    line_ideal, = ax.plot(f_mhz, psd_ideal, 'k--', lw=1.2,
-                          label='Ideal (linear PA)')
-    line_nodpd, = ax.plot(f_mhz, psd_no_dpd, color='#1f77b4', lw=0.6,
-                          alpha=0.4, label='No DPD (reference)')
-    line_current, = ax.plot([], [], color='#d62728', lw=1.2,
-                            label='Current iteration')
+    fig, (ax_psd, ax_aclr) = plt.subplots(1, 2, figsize=(18, 6),
+                                           gridspec_kw={'width_ratios': [2, 1]})
+
+    # --- Left: PSD plot ---
+    ax_psd.plot(f_mhz, psd_ideal, 'k--', lw=1.2, label='Ideal (linear PA)')
+    ax_psd.plot(f_mhz, psd_no_dpd, color='#1f77b4', lw=0.6, alpha=0.4,
+                label='No DPD (reference)')
+    line_current, = ax_psd.plot([], [], color='#d62728', lw=1.2,
+                                label='Current iteration')
 
     for ci in range(n_carriers):
         fc = (ci - (n_carriers - 1) / 2.0) * carrier_spacing / 1e6
         lo, hi = fc - carrier_bw_mhz / 2, fc + carrier_bw_mhz / 2
         lbl = f'{carrier_bw_mhz} MHz carrier' if ci == 0 else None
-        ax.axvspan(lo, hi, color='green', alpha=0.06, label=lbl)
+        ax_psd.axvspan(lo, hi, color='green', alpha=0.06, label=lbl)
 
-    ax.set_xlim(-20, 20)
-    ax.set_ylim(-80, 5)
-    ax.set_xlabel('Frequency (MHz)', fontsize=12)
-    ax.set_ylabel('PSD (dB, normalized)', fontsize=12)
-    title_text = ax.set_title('', fontsize=13)
-    ax.legend(loc='lower center', fontsize=10, ncol=2)
-    ax.grid(True, alpha=0.3)
+    ax_psd.set_xlim(-20, 20)
+    ax_psd.set_ylim(-80, 5)
+    ax_psd.set_xlabel('Frequency (MHz)', fontsize=12)
+    ax_psd.set_ylabel('PSD (dB, normalized)', fontsize=12)
+    ax_psd.set_title(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz — GMP DPD',
+                     fontsize=13)
+    ax_psd.legend(loc='lower center', fontsize=9, ncol=2)
+    ax_psd.grid(True, alpha=0.3)
+
+    # Text annotation box on the PSD plot
+    annot_text = ax_psd.text(0.02, 0.97, '', transform=ax_psd.transAxes,
+                             fontsize=11, verticalalignment='top',
+                             fontfamily='monospace',
+                             bbox=dict(boxstyle='round,pad=0.4',
+                                       facecolor='white', alpha=0.85,
+                                       edgecolor='gray'))
+
+    # --- Right: ACLR vs iteration ---
+    line_aclr_lo, = ax_aclr.plot([], [], 'o-', color='#2ca02c', lw=2,
+                                  markersize=7, label='ACLR lower')
+    line_aclr_hi, = ax_aclr.plot([], [], 's-', color='#ff7f0e', lw=2,
+                                  markersize=7, label='ACLR upper')
+    ax_aclr.axhline(45, color='gray', ls=':', lw=1.5, label='3GPP spec (45 dB)')
+    ax_aclr.set_xlim(-0.5, n_iterations + 0.5)
+    ax_aclr.set_ylim(aclr_min - 5, aclr_max + 5)
+    ax_aclr.set_xlabel('ILA Iteration', fontsize=12)
+    ax_aclr.set_ylabel('ACLR (dB)', fontsize=12)
+    ax_aclr.set_title('ACLR Convergence', fontsize=13)
+    ax_aclr.legend(loc='lower right', fontsize=10)
+    ax_aclr.grid(True, alpha=0.3)
+    ax_aclr.set_xticks(range(0, n_iterations + 1))
+
+    # Marker for current iteration on ACLR plot
+    marker_lo, = ax_aclr.plot([], [], 'o', color='#d62728', markersize=12,
+                               zorder=5, markeredgecolor='black', markeredgewidth=1.5)
+    marker_hi, = ax_aclr.plot([], [], 's', color='#d62728', markersize=12,
+                               zorder=5, markeredgecolor='black', markeredgewidth=1.5)
+
     fig.tight_layout()
 
     def init():
         line_current.set_data([], [])
-        return line_current, title_text
+        line_aclr_lo.set_data([], [])
+        line_aclr_hi.set_data([], [])
+        marker_lo.set_data([], [])
+        marker_hi.set_data([], [])
+        annot_text.set_text('')
+        return (line_current, line_aclr_lo, line_aclr_hi,
+                marker_lo, marker_hi, annot_text)
 
     def update(frame_idx):
-        label, psd, nmse = frames[frame_idx]
+        it, psd, nmse, aclr_lo, aclr_hi = frames[frame_idx]
+
+        # PSD curve
         line_current.set_data(f_mhz, psd)
-        title_text.set_text(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz — '
-                            f'GMP DPD convergence — '
-                            f'{label} — NMSE = {nmse:+.2f} dB')
-        return line_current, title_text
+
+        # Annotation
+        label = "No DPD" if it == 0 else f"ILA iter {it}"
+        annot_text.set_text(
+            f'Iteration: {it}\n'
+            f'NMSE:       {nmse:+.2f} dB\n'
+            f'ACLR lower: {aclr_lo:.1f} dB\n'
+            f'ACLR upper: {aclr_hi:.1f} dB'
+        )
+
+        # ACLR history up to current frame
+        iters_so_far = all_iters[:frame_idx + 1]
+        lo_so_far    = all_aclr_lo[:frame_idx + 1]
+        hi_so_far    = all_aclr_hi[:frame_idx + 1]
+        line_aclr_lo.set_data(iters_so_far, lo_so_far)
+        line_aclr_hi.set_data(iters_so_far, hi_so_far)
+
+        # Highlight current point
+        marker_lo.set_data([it], [aclr_lo])
+        marker_hi.set_data([it], [aclr_hi])
+
+        return (line_current, line_aclr_lo, line_aclr_hi,
+                marker_lo, marker_hi, annot_text)
 
     anim = FuncAnimation(fig, update, frames=len(frames),
                          init_func=init, blit=False, repeat=False)
 
     output_file = 'dpd_convergence.gif'
-    writer = PillowWriter(fps=1)  # 1 fps → each iteration holds 1 second
+    writer = PillowWriter(fps=1)
     anim.save(output_file, writer=writer, dpi=150)
     print(f"Movie saved to {output_file}")
 
     # Also save a static summary PNG with all iterations overlaid
-    fig2, ax2 = plt.subplots(figsize=(12, 6))
-    ax2.plot(f_mhz, psd_ideal, 'k--', lw=1.2, label='Ideal')
+    fig2, (ax2_psd, ax2_aclr) = plt.subplots(
+        1, 2, figsize=(18, 6), gridspec_kw={'width_ratios': [2, 1]})
+
+    ax2_psd.plot(f_mhz, psd_ideal, 'k--', lw=1.2, label='Ideal')
     cmap = plt.cm.coolwarm
-    for i, (label, psd, nmse) in enumerate(frames):
+    for i, (it, psd, nmse, aclr_lo, aclr_hi) in enumerate(frames):
         color = cmap(i / max(len(frames) - 1, 1))
-        alpha = 0.4 if i == 0 else 0.8
+        alpha_val = 0.4 if i == 0 else 0.8
         lw = 0.7 if i == 0 else 1.0
-        ax2.plot(f_mhz, psd, color=color, lw=lw, alpha=alpha,
-                 label=f'{label} ({nmse:+.1f} dB)')
+        ax2_psd.plot(f_mhz, psd, color=color, lw=lw, alpha=alpha_val,
+                     label=f'Iter {it} ({nmse:+.1f} dB)')
     for ci in range(n_carriers):
         fc = (ci - (n_carriers - 1) / 2.0) * carrier_spacing / 1e6
         lo, hi = fc - carrier_bw_mhz / 2, fc + carrier_bw_mhz / 2
-        ax2.axvspan(lo, hi, color='green', alpha=0.04)
-    ax2.set_xlim(-20, 20)
-    ax2.set_ylim(-80, 5)
-    ax2.set_xlabel('Frequency (MHz)', fontsize=12)
-    ax2.set_ylabel('PSD (dB, normalized)', fontsize=12)
-    ax2.set_title(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz — '
-                  f'GMP DPD convergence (all iterations)', fontsize=13)
-    ax2.legend(loc='lower left', fontsize=8, ncol=2)
-    ax2.grid(True, alpha=0.3)
+        ax2_psd.axvspan(lo, hi, color='green', alpha=0.04)
+    ax2_psd.set_xlim(-20, 20)
+    ax2_psd.set_ylim(-80, 5)
+    ax2_psd.set_xlabel('Frequency (MHz)', fontsize=12)
+    ax2_psd.set_ylabel('PSD (dB, normalized)', fontsize=12)
+    ax2_psd.set_title('PSD — all iterations', fontsize=13)
+    ax2_psd.legend(loc='lower left', fontsize=8, ncol=2)
+    ax2_psd.grid(True, alpha=0.3)
+
+    ax2_aclr.plot(all_iters, all_aclr_lo, 'o-', color='#2ca02c', lw=2,
+                  markersize=7, label='ACLR lower')
+    ax2_aclr.plot(all_iters, all_aclr_hi, 's-', color='#ff7f0e', lw=2,
+                  markersize=7, label='ACLR upper')
+    ax2_aclr.axhline(45, color='gray', ls=':', lw=1.5, label='3GPP spec (45 dB)')
+    ax2_aclr.set_xlim(-0.5, n_iterations + 0.5)
+    ax2_aclr.set_ylim(aclr_min - 5, aclr_max + 5)
+    ax2_aclr.set_xlabel('ILA Iteration', fontsize=12)
+    ax2_aclr.set_ylabel('ACLR (dB)', fontsize=12)
+    ax2_aclr.set_title('ACLR Convergence', fontsize=13)
+    ax2_aclr.legend(loc='lower right', fontsize=10)
+    ax2_aclr.grid(True, alpha=0.3)
+    ax2_aclr.set_xticks(range(0, n_iterations + 1))
+
     fig2.tight_layout()
     fig2.savefig('dpd_convergence_summary.png', dpi=150)
     print("Summary plot saved to dpd_convergence_summary.png")
