@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.signal import welch
+from scipy.signal import welch, firwin, kaiserord
 from scipy.signal.windows import blackmanharris
 
 
@@ -62,7 +62,20 @@ def generate_wcdma(n_samples, n_codes=8, chip_rate=3.84e6, fs=61.44e6, sf=16):
 
     filtered = np.convolve(upsampled, h_rrc, mode='full')
     start = len(h_rrc) // 2
-    return filtered[start : start + n_samples]
+    rrc_out = filtered[start : start + n_samples]
+
+    # Channel FIR filter: -80 dB sidelobes, passband = occupied BW
+    passband_edge = chip_rate * (1 + alpha) / 2   # 2.3424 MHz
+    stopband_edge = chip_rate * (1 + alpha) / 2 + 0.5e6
+    transition_width = stopband_edge - passband_edge
+    numtaps, beta = kaiserord(80, transition_width / (fs / 2))
+    if numtaps % 2 == 0:
+        numtaps += 1
+    cutoff = (passband_edge + stopband_edge) / 2
+    h_chan = firwin(numtaps, cutoff, window=('kaiser', beta), fs=fs)
+    chan_filtered = np.convolve(rrc_out, h_chan, mode='full')
+    start2 = len(h_chan) // 2
+    return chan_filtered[start2 : start2 + n_samples]
 
 
 def generate_multicarrier_wcdma(n_samples, n_carriers=3, carrier_spacing=5e6,
