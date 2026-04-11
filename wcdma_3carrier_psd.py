@@ -93,7 +93,7 @@ def main():
     n_carriers = 3
     carrier_spacing = 5e6
     carrier_bw_mhz = 5
-    n_codes = 8
+    n_codes = 16
     N = 1_000_000
 
     print(f"Generating {n_carriers}-carrier WCDMA signal: "
