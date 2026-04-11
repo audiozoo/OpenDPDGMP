@@ -498,7 +498,7 @@ def main():
     carrier_spacing = 5e6       # 5 MHz centre-to-centre
     bw_mhz          = n_carriers * carrier_bw_mhz   # 15 MHz aggregate
     fs              = 61.44e6   # sampling rate → ±30.72 MHz Nyquist
-    n_codes         = 8         # active codes per carrier
+    n_codes         = 16        # active codes per carrier (full SF)
 
     N_train = 1_000_000
     N_test  = 1_000_000
