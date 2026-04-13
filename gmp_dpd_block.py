@@ -295,7 +295,9 @@ def main():
     # Block-based processing
     # ------------------------------------------------------------------
     w = None
+    w_prev = None
     block_metrics = []  # (block_idx, nmse, aclr_lo, aclr_hi)
+    coeff_nmse_list = []  # NMSE between successive coefficient vectors
 
     for b in range(n_blocks):
         s = b * BLOCK_SIZE
@@ -317,6 +319,14 @@ def main():
             w_new = identify_gmp(x_dpd_block, y_block, cfg, target_gain)
             w = damping * w_new + (1 - damping) * w
 
+        # Track coefficient change: NMSE between w and w_prev
+        if w_prev is not None:
+            delta = w - w_prev
+            coeff_nmse = 10.0 * np.log10(
+                np.sum(np.abs(delta)**2) / np.sum(np.abs(w_prev)**2))
+            coeff_nmse_list.append((b, coeff_nmse))
+        w_prev = w.copy()
+
         # Measure metrics on this block using current coefficients
         x_eval_dpd = apply_dpd(x_block, w, cfg)
         y_eval = pa(x_eval_dpd)
@@ -326,9 +336,12 @@ def main():
         block_metrics.append((b, nmse_val, aclr_lo, aclr_hi))
 
         if b % 10 == 0 or b == n_blocks - 1:
+            coeff_str = (f", Δw = {coeff_nmse_list[-1][1]:+.1f} dB"
+                         if coeff_nmse_list else "")
             print(f"  Block {b:3d}/{n_blocks}: "
                   f"NMSE = {nmse_val:+.2f} dB, "
-                  f"ACLR = {aclr_lo:.1f} / {aclr_hi:.1f} dB")
+                  f"ACLR = {aclr_lo:.1f} / {aclr_hi:.1f} dB"
+                  f"{coeff_str}")
 
     # ------------------------------------------------------------------
     # Final evaluation on the entire signal with converged coefficients
@@ -369,15 +382,18 @@ def main():
     _,     psd_no_dpd   = compute_psd_db(y_no_dpd_full)
     _,     psd_dpd_final = compute_psd_db(y_dpd_final)
 
-    blocks_arr = np.array([m[0] for m in block_metrics])
-    nmse_arr   = np.array([m[1] for m in block_metrics])
+    blocks_arr  = np.array([m[0] for m in block_metrics])
+    nmse_arr    = np.array([m[1] for m in block_metrics])
     aclr_lo_arr = np.array([m[2] for m in block_metrics])
     aclr_hi_arr = np.array([m[3] for m in block_metrics])
 
-    fig, (ax_psd, ax_nmse, ax_aclr) = plt.subplots(
-        1, 3, figsize=(22, 6), gridspec_kw={'width_ratios': [2, 1, 1]})
+    coeff_blocks_arr = np.array([m[0] for m in coeff_nmse_list])
+    coeff_nmse_arr   = np.array([m[1] for m in coeff_nmse_list])
 
-    # --- Left: PSD ---
+    fig, ((ax_psd, ax_nmse), (ax_coeff, ax_aclr)) = plt.subplots(
+        2, 2, figsize=(18, 10), gridspec_kw={'width_ratios': [2, 1]})
+
+    # --- Top-left: PSD ---
     ax_psd.plot(f_mhz, psd_ideal,     'k--', lw=1.2, label='Ideal (linear PA)')
     ax_psd.plot(f_mhz, psd_no_dpd,    color='#1f77b4', lw=0.8, alpha=0.6,
                 label='PA output — no DPD')
@@ -400,17 +416,27 @@ def main():
     ax_psd.legend(loc='lower center', fontsize=9, ncol=2)
     ax_psd.grid(True, alpha=0.3)
 
-    # --- Middle: NMSE vs block ---
+    # --- Top-right: NMSE vs block ---
     ax_nmse.plot(blocks_arr, nmse_arr, '-', color='#9467bd', lw=1.2)
     ax_nmse.axhline(nmse_baseline, color='#1f77b4', ls=':', lw=1.5,
                     label=f'No DPD ({nmse_baseline:+.1f} dB)')
     ax_nmse.set_xlabel('Block index', fontsize=12)
     ax_nmse.set_ylabel('NMSE (dB)', fontsize=12)
-    ax_nmse.set_title('NMSE Convergence', fontsize=13)
+    ax_nmse.set_title('Output NMSE Convergence', fontsize=13)
     ax_nmse.legend(loc='upper right', fontsize=10)
     ax_nmse.grid(True, alpha=0.3)
 
-    # --- Right: ACLR vs block ---
+    # --- Bottom-left: Coefficient NMSE vs block ---
+    ax_coeff.plot(coeff_blocks_arr, coeff_nmse_arr, '-', color='#e377c2', lw=1.2)
+    ax_coeff.set_xlabel('Block index', fontsize=12)
+    ax_coeff.set_ylabel('Coefficient NMSE (dB)', fontsize=12)
+    ax_coeff.set_title('Coefficient Change: '
+                       r'$10\log_{10}\left(\Vert\mathbf{w}_k - \mathbf{w}_{k-1}\Vert^2'
+                       r' / \Vert\mathbf{w}_{k-1}\Vert^2\right)$',
+                       fontsize=11)
+    ax_coeff.grid(True, alpha=0.3)
+
+    # --- Bottom-right: ACLR vs block ---
     ax_aclr.plot(blocks_arr, aclr_lo_arr, '-', color='#2ca02c', lw=1.2,
                  label='ACLR lower')
     ax_aclr.plot(blocks_arr, aclr_hi_arr, '-', color='#ff7f0e', lw=1.2,
