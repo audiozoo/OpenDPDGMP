@@ -315,7 +315,6 @@ def main():
 
     f_mhz_psd, psd_ideal_raw = compute_psd_db(ideal_full)
     _, psd_no_dpd_raw = compute_psd_db(y_no_dpd_full)
-    psd_ref_power = np.max(psd_ideal_raw)
 
     for b in range(n_blocks):
         s = b * BLOCK_SIZE
@@ -375,7 +374,7 @@ def main():
         x_dpd_cur = apply_dpd(x_full_iq, w, cfg)
         y_dpd_cur = pa(x_dpd_cur)
         _, psd_cur_raw = compute_psd_db(y_dpd_cur)
-        block_psd_list.append(10 * np.log10(psd_cur_raw / psd_ref_power))
+        block_psd_list.append(10 * np.log10(psd_cur_raw / np.max(psd_cur_raw)))
 
         if b % 10 == 0 or b == n_blocks - 1:
             coeff_str = ""
@@ -415,8 +414,8 @@ def main():
     # ------------------------------------------------------------------
     # Prepare arrays for plotting
     # ------------------------------------------------------------------
-    psd_ideal_db  = 10 * np.log10(psd_ideal_raw / psd_ref_power)
-    psd_no_dpd_db = 10 * np.log10(psd_no_dpd_raw / psd_ref_power)
+    psd_ideal_db  = 10 * np.log10(psd_ideal_raw / np.max(psd_ideal_raw))
+    psd_no_dpd_db = 10 * np.log10(psd_no_dpd_raw / np.max(psd_no_dpd_raw))
 
     blocks_arr   = np.array([m[0] for m in block_metrics])
     nmse_arr     = np.array([m[1] for m in block_metrics])
