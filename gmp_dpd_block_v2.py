@@ -21,6 +21,7 @@ from typing import Tuple, Optional
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 from scipy.signal import welch, firwin, kaiserord
 from scipy.signal.windows import blackmanharris
 
@@ -297,8 +298,24 @@ def main():
     w_prev = None
     block_metrics = []    # (block_idx, nmse, aclr_lo, aclr_hi, accepted)
     coeff_nmse_list = []  # (block_idx, coeff_nmse, accepted)
+    block_psd_list = []   # per-block PSD (dB) for animation
     n_rejected = 0
     coeff_update_idx = 0  # counts accepted coefficient updates
+
+    nperseg_psd = 8192
+    noverlap_psd = nperseg_psd * 3 // 4
+    psd_window = blackmanharris(nperseg_psd)
+
+    def compute_psd_db(iq):
+        c = iq_to_complex(iq) if iq.ndim == 2 else iq
+        f, p = welch(c, fs=fs, nperseg=nperseg_psd, window=psd_window,
+                     noverlap=noverlap_psd, return_onesided=False, scaling='density')
+        idx = np.argsort(f)
+        return f[idx] / 1e6, p[idx]
+
+    f_mhz_psd, psd_ideal_raw = compute_psd_db(ideal_full)
+    _, psd_no_dpd_raw = compute_psd_db(y_no_dpd_full)
+    psd_ref_power = np.max(psd_ideal_raw)
 
     for b in range(n_blocks):
         s = b * BLOCK_SIZE
@@ -353,6 +370,13 @@ def main():
                                     nperseg=min(4096, BLOCK_SIZE))
         block_metrics.append((b, nmse_val, aclr_lo, aclr_hi, accepted))
 
+        # Compute PSD of the PA output using the *current* coefficients on
+        # the full test signal.  Done every block for the animation.
+        x_dpd_cur = apply_dpd(x_full_iq, w, cfg)
+        y_dpd_cur = pa(x_dpd_cur)
+        _, psd_cur_raw = compute_psd_db(y_dpd_cur)
+        block_psd_list.append(10 * np.log10(psd_cur_raw / psd_ref_power))
+
         if b % 10 == 0 or b == n_blocks - 1:
             coeff_str = ""
             if coeff_nmse_list:
@@ -389,22 +413,10 @@ def main():
     print(f"{'='*65}")
 
     # ------------------------------------------------------------------
-    # Plots: 2×2 — PSD, NMSE vs block, Coeff NMSE vs block, ACLR vs block
+    # Prepare arrays for plotting
     # ------------------------------------------------------------------
-    nperseg_psd = 8192
-    noverlap_psd = nperseg_psd * 3 // 4
-    psd_window = blackmanharris(nperseg_psd)
-
-    def compute_psd_db(iq):
-        c = iq_to_complex(iq) if iq.ndim == 2 else iq
-        f, p = welch(c, fs=fs, nperseg=nperseg_psd, window=psd_window,
-                     noverlap=noverlap_psd, return_onesided=False, scaling='density')
-        idx = np.argsort(f)
-        return f[idx] / 1e6, 10 * np.log10(p[idx] / np.max(p[idx]))
-
-    f_mhz, psd_ideal   = compute_psd_db(ideal_full)
-    _,     psd_no_dpd   = compute_psd_db(y_no_dpd_full)
-    _,     psd_dpd_final = compute_psd_db(y_dpd_final)
+    psd_ideal_db  = 10 * np.log10(psd_ideal_raw / psd_ref_power)
+    psd_no_dpd_db = 10 * np.log10(psd_no_dpd_raw / psd_ref_power)
 
     blocks_arr   = np.array([m[0] for m in block_metrics])
     nmse_arr     = np.array([m[1] for m in block_metrics])
@@ -416,113 +428,277 @@ def main():
     coeff_nmse_arr   = np.array([m[1] for m in coeff_nmse_list])
     coeff_accepted   = np.array([m[2] for m in coeff_nmse_list])
 
-    fig = plt.figure(figsize=(22, 12))
-    gs = fig.add_gridspec(2, 3, width_ratios=[2, 1, 1])
+    acc_blocks  = blocks_arr[accepted_arr]
+    acc_aclr_lo = aclr_lo_arr[accepted_arr]
+    acc_aclr_hi = aclr_hi_arr[accepted_arr]
 
-    ax_psd       = fig.add_subplot(gs[0, 0])
-    ax_nmse      = fig.add_subplot(gs[0, 1])
-    ax_coeff     = fig.add_subplot(gs[0, 2])
-    ax_aclr      = fig.add_subplot(gs[1, 0])
-    ax_aclr_acc  = fig.add_subplot(gs[1, 1:])
+    # Axis limits for convergence plots
+    nmse_ylim  = (min(nmse_arr.min(), nmse_baseline) - 5,
+                  max(nmse_arr.max(), nmse_baseline) + 5)
+    coeff_ylim = (coeff_nmse_arr.min() - 3, max(coeff_nmse_arr.max(), 5) + 3)
+    aclr_lo_min = min(aclr_lo_arr.min(), aclr_hi_arr.min(), aclr_lo_base)
+    aclr_hi_max = max(aclr_lo_arr.max(), aclr_hi_arr.max())
+    aclr_ylim  = (aclr_lo_min - 5, aclr_hi_max + 5)
 
-    # --- Top-left: PSD ---
-    ax_psd.plot(f_mhz, psd_ideal,     'k--', lw=1.2, label='Ideal (linear PA)')
-    ax_psd.plot(f_mhz, psd_no_dpd,    color='#1f77b4', lw=0.8, alpha=0.6,
-                label='PA output — no DPD')
-    ax_psd.plot(f_mhz, psd_dpd_final, color='#d62728', lw=1.0,
-                label='PA output — block DPD (final)')
+    # ------------------------------------------------------------------
+    # Static summary PNG  (same layout as before)
+    # ------------------------------------------------------------------
+    fig_s = plt.figure(figsize=(22, 12))
+    gs_s = fig_s.add_gridspec(2, 3, width_ratios=[2, 1, 1])
 
+    ax = {}
+    ax['psd']      = fig_s.add_subplot(gs_s[0, 0])
+    ax['nmse']     = fig_s.add_subplot(gs_s[0, 1])
+    ax['coeff']    = fig_s.add_subplot(gs_s[0, 2])
+    ax['aclr']     = fig_s.add_subplot(gs_s[1, 0])
+    ax['aclr_acc'] = fig_s.add_subplot(gs_s[1, 1:])
+
+    ax['psd'].plot(f_mhz_psd, psd_ideal_db, 'k--', lw=1.2,
+                   label='Ideal (linear PA)')
+    ax['psd'].plot(f_mhz_psd, psd_no_dpd_db, color='#1f77b4', lw=0.8,
+                   alpha=0.6, label='PA output — no DPD')
+    ax['psd'].plot(f_mhz_psd, block_psd_list[-1], color='#d62728', lw=1.0,
+                   label='PA output — block DPD (final)')
     for ci in range(n_carriers):
         fc = (ci - (n_carriers - 1) / 2.0) * carrier_spacing / 1e6
         lo, hi = fc - carrier_bw_mhz / 2, fc + carrier_bw_mhz / 2
         lbl = f'{carrier_bw_mhz} MHz carrier' if ci == 0 else None
-        ax_psd.axvspan(lo, hi, color='green', alpha=0.06, label=lbl)
+        ax['psd'].axvspan(lo, hi, color='green', alpha=0.06, label=lbl)
+    ax['psd'].set_xlim(-20, 20); ax['psd'].set_ylim(-80, 5)
+    ax['psd'].set_xlabel('Frequency (MHz)', fontsize=12)
+    ax['psd'].set_ylabel('PSD (dB, normalized)', fontsize=12)
+    ax['psd'].set_title(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz — '
+                        f'Block DPD v2 ({BLOCK_SIZE} samples/block, '
+                        f'guard > {COEFF_NMSE_THRESHOLD:.0f} dB)', fontsize=11)
+    ax['psd'].legend(loc='lower center', fontsize=9, ncol=2)
+    ax['psd'].grid(True, alpha=0.3)
 
-    ax_psd.set_xlim(-20, 20)
-    ax_psd.set_ylim(-80, 5)
-    ax_psd.set_xlabel('Frequency (MHz)', fontsize=12)
-    ax_psd.set_ylabel('PSD (dB, normalized)', fontsize=12)
-    ax_psd.set_title(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz — '
-                     f'Block DPD v2 ({BLOCK_SIZE} samples/block, '
-                     f'guard > {COEFF_NMSE_THRESHOLD:.0f} dB)',
-                     fontsize=11)
-    ax_psd.legend(loc='lower center', fontsize=9, ncol=2)
-    ax_psd.grid(True, alpha=0.3)
+    ax['nmse'].plot(blocks_arr, nmse_arr, '-', color='#9467bd', lw=1.2)
+    ax['nmse'].axhline(nmse_baseline, color='#1f77b4', ls=':', lw=1.5,
+                       label=f'No DPD ({nmse_baseline:+.1f} dB)')
+    ax['nmse'].set_xlabel('Block index', fontsize=12)
+    ax['nmse'].set_ylabel('NMSE (dB)', fontsize=12)
+    ax['nmse'].set_title('Output NMSE Convergence', fontsize=13)
+    ax['nmse'].legend(loc='upper right', fontsize=10)
+    ax['nmse'].grid(True, alpha=0.3)
 
-    # --- Top-middle: NMSE vs block ---
-    ax_nmse.plot(blocks_arr, nmse_arr, '-', color='#9467bd', lw=1.2)
-    ax_nmse.axhline(nmse_baseline, color='#1f77b4', ls=':', lw=1.5,
-                    label=f'No DPD ({nmse_baseline:+.1f} dB)')
-    ax_nmse.set_xlabel('Block index', fontsize=12)
-    ax_nmse.set_ylabel('NMSE (dB)', fontsize=12)
-    ax_nmse.set_title('Output NMSE Convergence', fontsize=13)
-    ax_nmse.legend(loc='upper right', fontsize=10)
-    ax_nmse.grid(True, alpha=0.3)
-
-    # --- Top-right: Coefficient NMSE vs block (accepted / rejected) ---
-    acc_mask = coeff_accepted
-    rej_mask = ~coeff_accepted
-
-    ax_coeff.plot(coeff_blocks_arr, coeff_nmse_arr, '-', color='#e377c2',
-                  lw=0.8, alpha=0.5)
+    acc_mask = coeff_accepted; rej_mask = ~coeff_accepted
+    ax['coeff'].plot(coeff_blocks_arr, coeff_nmse_arr, '-', color='#e377c2',
+                     lw=0.8, alpha=0.5)
     if np.any(acc_mask):
-        ax_coeff.scatter(coeff_blocks_arr[acc_mask], coeff_nmse_arr[acc_mask],
-                         c='#2ca02c', s=25, zorder=3, label='Accepted')
+        ax['coeff'].scatter(coeff_blocks_arr[acc_mask],
+                            coeff_nmse_arr[acc_mask],
+                            c='#2ca02c', s=25, zorder=3, label='Accepted')
     if np.any(rej_mask):
-        ax_coeff.scatter(coeff_blocks_arr[rej_mask], coeff_nmse_arr[rej_mask],
-                         c='#d62728', s=35, marker='x', linewidths=2,
-                         zorder=3, label='Rejected')
+        ax['coeff'].scatter(coeff_blocks_arr[rej_mask],
+                            coeff_nmse_arr[rej_mask],
+                            c='#d62728', s=35, marker='x', linewidths=2,
+                            zorder=3, label='Rejected')
+    ax['coeff'].axhline(COEFF_NMSE_THRESHOLD, color='gray', ls='--', lw=1.5,
+                        label=f'Threshold ({COEFF_NMSE_THRESHOLD:.0f} dB)')
+    ax['coeff'].set_xlabel('Block index', fontsize=12)
+    ax['coeff'].set_ylabel('Coefficient NMSE (dB)', fontsize=12)
+    ax['coeff'].set_title('Coefficient Change', fontsize=13)
+    ax['coeff'].legend(loc='upper right', fontsize=9)
+    ax['coeff'].grid(True, alpha=0.3)
 
-    ax_coeff.axhline(COEFF_NMSE_THRESHOLD, color='gray', ls='--', lw=1.5,
-                     label=f'Threshold ({COEFF_NMSE_THRESHOLD:.0f} dB)')
-    ax_coeff.set_xlabel('Block index', fontsize=12)
-    ax_coeff.set_ylabel('Coefficient NMSE (dB)', fontsize=12)
-    ax_coeff.set_title('Coefficient Change: '
-                       r'$10\log_{10}\left(\Vert\mathbf{w}_k - \mathbf{w}_{k-1}\Vert^2'
-                       r' / \Vert\mathbf{w}_{k-1}\Vert^2\right)$',
-                       fontsize=11)
-    ax_coeff.legend(loc='upper right', fontsize=9)
-    ax_coeff.grid(True, alpha=0.3)
+    ax['aclr'].plot(blocks_arr, aclr_lo_arr, '-', color='#2ca02c', lw=1.2,
+                    label='ACLR lower')
+    ax['aclr'].plot(blocks_arr, aclr_hi_arr, '-', color='#ff7f0e', lw=1.2,
+                    label='ACLR upper')
+    ax['aclr'].axhline(45, color='gray', ls=':', lw=1.5,
+                       label='3GPP spec (45 dB)')
+    ax['aclr'].axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1,
+                       alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
+    ax['aclr'].set_xlabel('Block index', fontsize=12)
+    ax['aclr'].set_ylabel('ACLR (dB)', fontsize=12)
+    ax['aclr'].set_title('ACLR Convergence (all blocks)', fontsize=13)
+    ax['aclr'].legend(loc='lower right', fontsize=9)
+    ax['aclr'].grid(True, alpha=0.3)
 
-    # --- Bottom-left: ACLR vs block (all blocks) ---
-    ax_aclr.plot(blocks_arr, aclr_lo_arr, '-', color='#2ca02c', lw=1.2,
-                 label='ACLR lower')
-    ax_aclr.plot(blocks_arr, aclr_hi_arr, '-', color='#ff7f0e', lw=1.2,
-                 label='ACLR upper')
-    ax_aclr.axhline(45, color='gray', ls=':', lw=1.5, label='3GPP spec (45 dB)')
-    ax_aclr.axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1,
-                    alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
-    ax_aclr.set_xlabel('Block index', fontsize=12)
-    ax_aclr.set_ylabel('ACLR (dB)', fontsize=12)
-    ax_aclr.set_title('ACLR Convergence (all blocks)', fontsize=13)
-    ax_aclr.legend(loc='lower right', fontsize=9)
-    ax_aclr.grid(True, alpha=0.3)
+    update_idx = np.arange(len(acc_blocks))
+    ax['aclr_acc'].plot(update_idx, acc_aclr_lo, 'o-', color='#2ca02c',
+                        lw=1.2, markersize=4, label='ACLR lower')
+    ax['aclr_acc'].plot(update_idx, acc_aclr_hi, 's-', color='#ff7f0e',
+                        lw=1.2, markersize=4, label='ACLR upper')
+    ax['aclr_acc'].axhline(45, color='gray', ls=':', lw=1.5,
+                           label='3GPP spec (45 dB)')
+    ax['aclr_acc'].axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1,
+                           alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
+    ax['aclr_acc'].set_xlabel('Accepted update index', fontsize=12)
+    ax['aclr_acc'].set_ylabel('ACLR (dB)', fontsize=12)
+    ax['aclr_acc'].set_title(f'ACLR — accepted updates only '
+                             f'({len(acc_blocks)}/{n_blocks})', fontsize=13)
+    ax['aclr_acc'].legend(loc='lower right', fontsize=9)
+    ax['aclr_acc'].grid(True, alpha=0.3)
 
-    # --- Bottom-right: ACLR vs accepted update index ---
-    acc_blocks  = blocks_arr[accepted_arr]
-    acc_aclr_lo = aclr_lo_arr[accepted_arr]
-    acc_aclr_hi = aclr_hi_arr[accepted_arr]
-    update_idx  = np.arange(len(acc_blocks))
+    fig_s.tight_layout()
+    fig_s.savefig('gmp_dpd_block_v2_convergence.png', dpi=150)
+    print(f"\nStatic plot saved to gmp_dpd_block_v2_convergence.png")
+    plt.close(fig_s)
 
-    ax_aclr_acc.plot(update_idx, acc_aclr_lo, 'o-', color='#2ca02c', lw=1.2,
-                     markersize=4, label='ACLR lower')
-    ax_aclr_acc.plot(update_idx, acc_aclr_hi, 's-', color='#ff7f0e', lw=1.2,
-                     markersize=4, label='ACLR upper')
-    ax_aclr_acc.axhline(45, color='gray', ls=':', lw=1.5,
-                        label='3GPP spec (45 dB)')
-    ax_aclr_acc.axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1,
-                        alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
-    ax_aclr_acc.set_xlabel('Accepted update index', fontsize=12)
-    ax_aclr_acc.set_ylabel('ACLR (dB)', fontsize=12)
-    ax_aclr_acc.set_title(f'ACLR — accepted updates only '
-                          f'({len(acc_blocks)}/{n_blocks})', fontsize=13)
-    ax_aclr_acc.legend(loc='lower right', fontsize=9)
-    ax_aclr_acc.grid(True, alpha=0.3)
+    # ------------------------------------------------------------------
+    # Animated GIF — all 5 panels update frame-by-frame
+    # ------------------------------------------------------------------
+    print(f"Rendering animation ({n_blocks} frames)...")
 
-    fig.tight_layout()
-    output_file = 'gmp_dpd_block_v2_convergence.png'
-    fig.savefig(output_file, dpi=150)
-    print(f"\nPlot saved to {output_file}")
+    fig_a = plt.figure(figsize=(22, 12))
+    gs_a = fig_a.add_gridspec(2, 3, width_ratios=[2, 1, 1])
+
+    a_psd      = fig_a.add_subplot(gs_a[0, 0])
+    a_nmse     = fig_a.add_subplot(gs_a[0, 1])
+    a_coeff    = fig_a.add_subplot(gs_a[0, 2])
+    a_aclr     = fig_a.add_subplot(gs_a[1, 0])
+    a_aclr_acc = fig_a.add_subplot(gs_a[1, 1:])
+
+    # --- PSD: static background ---
+    a_psd.plot(f_mhz_psd, psd_ideal_db, 'k--', lw=1.2,
+               label='Ideal (linear PA)')
+    a_psd.plot(f_mhz_psd, psd_no_dpd_db, color='#1f77b4', lw=0.8,
+               alpha=0.4, label='PA output — no DPD')
+    line_psd, = a_psd.plot([], [], color='#d62728', lw=1.2,
+                           label='Current block DPD')
+    for ci in range(n_carriers):
+        fc = (ci - (n_carriers - 1) / 2.0) * carrier_spacing / 1e6
+        lo, hi = fc - carrier_bw_mhz / 2, fc + carrier_bw_mhz / 2
+        lbl = f'{carrier_bw_mhz} MHz carrier' if ci == 0 else None
+        a_psd.axvspan(lo, hi, color='green', alpha=0.06, label=lbl)
+    a_psd.set_xlim(-20, 20); a_psd.set_ylim(-80, 5)
+    a_psd.set_xlabel('Frequency (MHz)', fontsize=12)
+    a_psd.set_ylabel('PSD (dB, normalized)', fontsize=12)
+    a_psd.legend(loc='lower center', fontsize=8, ncol=2)
+    a_psd.grid(True, alpha=0.3)
+
+    psd_annot = a_psd.text(0.02, 0.97, '', transform=a_psd.transAxes,
+                           fontsize=10, verticalalignment='top',
+                           fontfamily='monospace',
+                           bbox=dict(boxstyle='round,pad=0.4',
+                                     facecolor='white', alpha=0.85,
+                                     edgecolor='gray'))
+
+    # --- NMSE ---
+    a_nmse.axhline(nmse_baseline, color='#1f77b4', ls=':', lw=1.5,
+                   label=f'No DPD ({nmse_baseline:+.1f} dB)')
+    line_nmse, = a_nmse.plot([], [], '-', color='#9467bd', lw=1.2)
+    marker_nmse, = a_nmse.plot([], [], 'o', color='#d62728', markersize=8,
+                               zorder=5)
+    a_nmse.set_xlim(-0.5, n_blocks - 0.5); a_nmse.set_ylim(*nmse_ylim)
+    a_nmse.set_xlabel('Block index', fontsize=12)
+    a_nmse.set_ylabel('NMSE (dB)', fontsize=12)
+    a_nmse.set_title('Output NMSE Convergence', fontsize=13)
+    a_nmse.legend(loc='upper right', fontsize=10)
+    a_nmse.grid(True, alpha=0.3)
+
+    # --- Coefficient NMSE ---
+    a_coeff.axhline(COEFF_NMSE_THRESHOLD, color='gray', ls='--', lw=1.5,
+                    label=f'Threshold ({COEFF_NMSE_THRESHOLD:.0f} dB)')
+    line_coeff, = a_coeff.plot([], [], '-', color='#e377c2', lw=0.8,
+                               alpha=0.5)
+    scat_coeff_acc = a_coeff.scatter([], [], c='#2ca02c', s=25, zorder=3,
+                                     label='Accepted')
+    scat_coeff_rej = a_coeff.scatter([], [], c='#d62728', s=35, marker='x',
+                                     linewidths=2, zorder=3, label='Rejected')
+    a_coeff.set_xlim(-0.5, n_blocks - 0.5); a_coeff.set_ylim(*coeff_ylim)
+    a_coeff.set_xlabel('Block index', fontsize=12)
+    a_coeff.set_ylabel('Coefficient NMSE (dB)', fontsize=12)
+    a_coeff.set_title('Coefficient Change', fontsize=13)
+    a_coeff.legend(loc='upper right', fontsize=9)
+    a_coeff.grid(True, alpha=0.3)
+
+    # --- ACLR (all blocks) ---
+    a_aclr.axhline(45, color='gray', ls=':', lw=1.5,
+                   label='3GPP spec (45 dB)')
+    a_aclr.axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1, alpha=0.7,
+                   label=f'No DPD ({aclr_lo_base:.0f} dB)')
+    line_aclr_lo, = a_aclr.plot([], [], '-', color='#2ca02c', lw=1.2,
+                                label='ACLR lower')
+    line_aclr_hi, = a_aclr.plot([], [], '-', color='#ff7f0e', lw=1.2,
+                                label='ACLR upper')
+    a_aclr.set_xlim(-0.5, n_blocks - 0.5); a_aclr.set_ylim(*aclr_ylim)
+    a_aclr.set_xlabel('Block index', fontsize=12)
+    a_aclr.set_ylabel('ACLR (dB)', fontsize=12)
+    a_aclr.set_title('ACLR Convergence (all blocks)', fontsize=13)
+    a_aclr.legend(loc='lower right', fontsize=9)
+    a_aclr.grid(True, alpha=0.3)
+
+    # --- ACLR (accepted only) ---
+    a_aclr_acc.axhline(45, color='gray', ls=':', lw=1.5,
+                       label='3GPP spec (45 dB)')
+    a_aclr_acc.axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1,
+                       alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
+    line_acc_lo, = a_aclr_acc.plot([], [], 'o-', color='#2ca02c', lw=1.2,
+                                   markersize=4, label='ACLR lower')
+    line_acc_hi, = a_aclr_acc.plot([], [], 's-', color='#ff7f0e', lw=1.2,
+                                   markersize=4, label='ACLR upper')
+    n_accepted_total = int(accepted_arr.sum())
+    a_aclr_acc.set_xlim(-0.5, n_accepted_total + 0.5)
+    a_aclr_acc.set_ylim(*aclr_ylim)
+    a_aclr_acc.set_xlabel('Accepted update index', fontsize=12)
+    a_aclr_acc.set_ylabel('ACLR (dB)', fontsize=12)
+    a_aclr_acc.set_title(f'ACLR — accepted updates only', fontsize=13)
+    a_aclr_acc.legend(loc='lower right', fontsize=9)
+    a_aclr_acc.grid(True, alpha=0.3)
+
+    fig_a.tight_layout()
+
+    def update(frame_idx):
+        b = frame_idx
+
+        # PSD
+        line_psd.set_data(f_mhz_psd, block_psd_list[b])
+        acc_tag = "" if accepted_arr[b] else "  [REJECTED]"
+        psd_annot.set_text(
+            f'Block: {blocks_arr[b]:.0f}{acc_tag}\n'
+            f'NMSE:       {nmse_arr[b]:+.2f} dB\n'
+            f'ACLR lower: {aclr_lo_arr[b]:.1f} dB\n'
+            f'ACLR upper: {aclr_hi_arr[b]:.1f} dB'
+        )
+        a_psd.set_title(f'{n_carriers}× WCDMA {carrier_bw_mhz} MHz — '
+                        f'Block {blocks_arr[b]:.0f}/{n_blocks}',
+                        fontsize=11)
+
+        # NMSE history
+        line_nmse.set_data(blocks_arr[:b+1], nmse_arr[:b+1])
+        marker_nmse.set_data([blocks_arr[b]], [nmse_arr[b]])
+
+        # Coeff NMSE history (coeff_nmse_list starts from block 1)
+        n_coeff = min(b, len(coeff_blocks_arr))
+        if n_coeff > 0:
+            line_coeff.set_data(coeff_blocks_arr[:n_coeff],
+                                coeff_nmse_arr[:n_coeff])
+            c_acc = coeff_accepted[:n_coeff]
+            c_rej = ~c_acc
+            if np.any(c_acc):
+                scat_coeff_acc.set_offsets(
+                    np.column_stack([coeff_blocks_arr[:n_coeff][c_acc],
+                                    coeff_nmse_arr[:n_coeff][c_acc]]))
+            if np.any(c_rej):
+                scat_coeff_rej.set_offsets(
+                    np.column_stack([coeff_blocks_arr[:n_coeff][c_rej],
+                                    coeff_nmse_arr[:n_coeff][c_rej]]))
+
+        # ACLR (all blocks)
+        line_aclr_lo.set_data(blocks_arr[:b+1], aclr_lo_arr[:b+1])
+        line_aclr_hi.set_data(blocks_arr[:b+1], aclr_hi_arr[:b+1])
+
+        # ACLR (accepted only)
+        n_acc_so_far = int(accepted_arr[:b+1].sum())
+        if n_acc_so_far > 0:
+            idx_acc = np.arange(n_acc_so_far)
+            line_acc_lo.set_data(idx_acc, acc_aclr_lo[:n_acc_so_far])
+            line_acc_hi.set_data(idx_acc, acc_aclr_hi[:n_acc_so_far])
+
+        return (line_psd, psd_annot, line_nmse, marker_nmse,
+                line_coeff, scat_coeff_acc, scat_coeff_rej,
+                line_aclr_lo, line_aclr_hi, line_acc_lo, line_acc_hi)
+
+    anim = FuncAnimation(fig_a, update, frames=n_blocks,
+                         blit=False, repeat=False)
+
+    gif_file = 'gmp_dpd_block_v2_convergence.gif'
+    writer = PillowWriter(fps=4)
+    anim.save(gif_file, writer=writer, dpi=120)
+    print(f"Animation saved to {gif_file}")
     plt.close('all')
 
 
