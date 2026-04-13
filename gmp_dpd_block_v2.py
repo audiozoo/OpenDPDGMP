@@ -295,9 +295,10 @@ def main():
     # ------------------------------------------------------------------
     w = None
     w_prev = None
-    block_metrics = []    # (block_idx, nmse, aclr_lo, aclr_hi)
+    block_metrics = []    # (block_idx, nmse, aclr_lo, aclr_hi, accepted)
     coeff_nmse_list = []  # (block_idx, coeff_nmse, accepted)
     n_rejected = 0
+    coeff_update_idx = 0  # counts accepted coefficient updates
 
     for b in range(n_blocks):
         s = b * BLOCK_SIZE
@@ -311,6 +312,7 @@ def main():
             w_new = identify_gmp(x_block, y_block, cfg, target_gain)
             w = w_new
             accepted = True
+            coeff_update_idx += 1
         else:
             # Apply current DPD, then pass through PA
             x_dpd_block = apply_dpd(x_block, w, cfg)
@@ -328,6 +330,7 @@ def main():
             if coeff_nmse <= COEFF_NMSE_THRESHOLD:
                 w = w_candidate
                 accepted = True
+                coeff_update_idx += 1
             else:
                 accepted = False
                 n_rejected += 1
@@ -348,7 +351,7 @@ def main():
         nmse_val = nmse_db(y_eval, ideal_block)
         aclr_lo, aclr_hi = aclr_db(y_eval, fs, channel_bw_hz,
                                     nperseg=min(4096, BLOCK_SIZE))
-        block_metrics.append((b, nmse_val, aclr_lo, aclr_hi))
+        block_metrics.append((b, nmse_val, aclr_lo, aclr_hi, accepted))
 
         if b % 10 == 0 or b == n_blocks - 1:
             coeff_str = ""
@@ -403,17 +406,24 @@ def main():
     _,     psd_no_dpd   = compute_psd_db(y_no_dpd_full)
     _,     psd_dpd_final = compute_psd_db(y_dpd_final)
 
-    blocks_arr  = np.array([m[0] for m in block_metrics])
-    nmse_arr    = np.array([m[1] for m in block_metrics])
-    aclr_lo_arr = np.array([m[2] for m in block_metrics])
-    aclr_hi_arr = np.array([m[3] for m in block_metrics])
+    blocks_arr   = np.array([m[0] for m in block_metrics])
+    nmse_arr     = np.array([m[1] for m in block_metrics])
+    aclr_lo_arr  = np.array([m[2] for m in block_metrics])
+    aclr_hi_arr  = np.array([m[3] for m in block_metrics])
+    accepted_arr = np.array([m[4] for m in block_metrics])
 
     coeff_blocks_arr = np.array([m[0] for m in coeff_nmse_list])
     coeff_nmse_arr   = np.array([m[1] for m in coeff_nmse_list])
     coeff_accepted   = np.array([m[2] for m in coeff_nmse_list])
 
-    fig, ((ax_psd, ax_nmse), (ax_coeff, ax_aclr)) = plt.subplots(
-        2, 2, figsize=(18, 10), gridspec_kw={'width_ratios': [2, 1]})
+    fig = plt.figure(figsize=(22, 12))
+    gs = fig.add_gridspec(2, 3, width_ratios=[2, 1, 1])
+
+    ax_psd       = fig.add_subplot(gs[0, 0])
+    ax_nmse      = fig.add_subplot(gs[0, 1])
+    ax_coeff     = fig.add_subplot(gs[0, 2])
+    ax_aclr      = fig.add_subplot(gs[1, 0])
+    ax_aclr_acc  = fig.add_subplot(gs[1, 1:])
 
     # --- Top-left: PSD ---
     ax_psd.plot(f_mhz, psd_ideal,     'k--', lw=1.2, label='Ideal (linear PA)')
@@ -439,7 +449,7 @@ def main():
     ax_psd.legend(loc='lower center', fontsize=9, ncol=2)
     ax_psd.grid(True, alpha=0.3)
 
-    # --- Top-right: NMSE vs block ---
+    # --- Top-middle: NMSE vs block ---
     ax_nmse.plot(blocks_arr, nmse_arr, '-', color='#9467bd', lw=1.2)
     ax_nmse.axhline(nmse_baseline, color='#1f77b4', ls=':', lw=1.5,
                     label=f'No DPD ({nmse_baseline:+.1f} dB)')
@@ -449,7 +459,7 @@ def main():
     ax_nmse.legend(loc='upper right', fontsize=10)
     ax_nmse.grid(True, alpha=0.3)
 
-    # --- Bottom-left: Coefficient NMSE vs block (accepted / rejected) ---
+    # --- Top-right: Coefficient NMSE vs block (accepted / rejected) ---
     acc_mask = coeff_accepted
     rej_mask = ~coeff_accepted
 
@@ -474,7 +484,7 @@ def main():
     ax_coeff.legend(loc='upper right', fontsize=9)
     ax_coeff.grid(True, alpha=0.3)
 
-    # --- Bottom-right: ACLR vs block ---
+    # --- Bottom-left: ACLR vs block (all blocks) ---
     ax_aclr.plot(blocks_arr, aclr_lo_arr, '-', color='#2ca02c', lw=1.2,
                  label='ACLR lower')
     ax_aclr.plot(blocks_arr, aclr_hi_arr, '-', color='#ff7f0e', lw=1.2,
@@ -484,9 +494,30 @@ def main():
                     alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
     ax_aclr.set_xlabel('Block index', fontsize=12)
     ax_aclr.set_ylabel('ACLR (dB)', fontsize=12)
-    ax_aclr.set_title('ACLR Convergence', fontsize=13)
+    ax_aclr.set_title('ACLR Convergence (all blocks)', fontsize=13)
     ax_aclr.legend(loc='lower right', fontsize=9)
     ax_aclr.grid(True, alpha=0.3)
+
+    # --- Bottom-right: ACLR vs accepted update index ---
+    acc_blocks  = blocks_arr[accepted_arr]
+    acc_aclr_lo = aclr_lo_arr[accepted_arr]
+    acc_aclr_hi = aclr_hi_arr[accepted_arr]
+    update_idx  = np.arange(len(acc_blocks))
+
+    ax_aclr_acc.plot(update_idx, acc_aclr_lo, 'o-', color='#2ca02c', lw=1.2,
+                     markersize=4, label='ACLR lower')
+    ax_aclr_acc.plot(update_idx, acc_aclr_hi, 's-', color='#ff7f0e', lw=1.2,
+                     markersize=4, label='ACLR upper')
+    ax_aclr_acc.axhline(45, color='gray', ls=':', lw=1.5,
+                        label='3GPP spec (45 dB)')
+    ax_aclr_acc.axhline(aclr_lo_base, color='#1f77b4', ls=':', lw=1,
+                        alpha=0.7, label=f'No DPD ({aclr_lo_base:.0f} dB)')
+    ax_aclr_acc.set_xlabel('Accepted update index', fontsize=12)
+    ax_aclr_acc.set_ylabel('ACLR (dB)', fontsize=12)
+    ax_aclr_acc.set_title(f'ACLR — accepted updates only '
+                          f'({len(acc_blocks)}/{n_blocks})', fontsize=13)
+    ax_aclr_acc.legend(loc='lower right', fontsize=9)
+    ax_aclr_acc.grid(True, alpha=0.3)
 
     fig.tight_layout()
     output_file = 'gmp_dpd_block_v2_convergence.png'
